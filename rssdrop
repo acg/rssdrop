@@ -1,0 +1,544 @@
+#!/usr/bin/perl -w
+
+use XML::Simple qw/XMLout XMLin/;
+use Getopt::Long;
+use Digest::MD5 qw/md5_hex/;
+use POSIX qw/strftime/;
+use LWP::UserAgent;
+use Date::Manip;
+use strict;
+
+my %opt = ( prefix => $ENV{RSSDROP_PREFIX} || "$ENV{HOME}/.rssdrop" );
+my @getopt = qw/prefix=s mailfolder=s add delete verbose help/;
+
+GetOptions(\%opt, @getopt) or do { print STDERR usage(); exit 1; };
+do { print usage(); exit 0; } if $opt{help};
+
+if (!-e "$opt{prefix}/config") {
+  print STDERR "entering one-time setup...\n";
+  setup();
+}
+
+my $config = read_config("$opt{prefix}/config");
+my $mdu = mdu_init();
+my $ua = LWP::UserAgent->new;
+
+$config->{mailfolder} = $opt{mailfolder} if $opt{mailfolder};
+
+if ($opt{add}) {
+  while (my ($feedname, $feedurl) = splice @ARGV, 0, 2) {
+    my $response = $ua->get($feedurl);
+    die "error fetching feed" unless $response;
+    die "error fetching feed: $response->message" unless $response->is_success;
+
+    my $rss = eval { XMLin($response->content) };
+    die "error, invalid rss: $feedurl" if $@ or !$rss or !$rss->{channel};
+
+    $config->{feeds}->{$feedname}->{url} = $feedurl;
+  }
+  safe_write_config($config);
+}
+elsif ($opt{delete}) {
+  while (my $feedname = shift @ARGV) {
+    die "error deleting $feedname, not found"
+      unless delete $config->{feeds}->{$feedname};
+  }
+  safe_write_config($config);
+}
+else {
+  my @feednames = @ARGV ? @ARGV : sort keys %{$config->{feeds}};
+
+  for my $feedname (@feednames) {
+    my $feed = $config->{feeds}->{$feedname};
+    $feed->{name} = $feedname;
+    $feed->{dir} = "$opt{prefix}/feeds/$feedname";
+    $feed->{maildir} = "$config->{mailfolder}/$feedname";
+
+    init_feeddir($feed->{dir});
+    init_maildir($feed->{maildir});
+
+    $feed->{tempdir} = tempdir("$feed->{dir}/XXXXX");
+    $feed->{rssfile} = "$feed->{dir}/rss/index.rss";
+
+    # fetch and parse the rss feed
+
+    fetch_feed($feed);
+
+    # process items in the feed: fetch fulltext and deliver
+
+    for my $item (@{ rss_items($feed->{rss}) }) {
+      eval { drop_item($feed, $item); };
+      warn "$@" if $@;
+    }
+
+    rmdir $feed->{tempdir} or
+      die "error removing temporary directory $feed->{tempdir}: $!";
+  }
+}
+
+exit 0;
+
+
+sub usage {
+  my $usage = qq{
+  rssdrop [-a feed url] | [-d feed] | [feed1 feed2 ...]
+    --add          feed1 url1 feed2 urls2
+    --delete       feed1 feed2
+    --prefix       path/to/rssdrop/dir
+    --mailfolder   path/to/mailfolder
+    --verbose
+    --help
+  };
+
+  $usage =~ s/\n  /\n/g;
+  $usage =~ s/^\n//;
+  return $usage;
+}
+
+sub setup {
+  die "no mailfolder specified (--mailfolder=xyz)" unless $opt{mailfolder};
+  ensure_dir($opt{prefix});
+  safe_write_config({ mailfolder => $opt{mailfolder} });
+}
+
+sub fetch_feed {  
+  my $feed = shift;
+
+  verbose("fetching feed $feed->{url}");
+  fetch_atomic($ua, @{$feed}{qw/url rssfile/}, "$feed->{tempdir}/index.rss");
+
+  $feed->{rss} = XMLin($feed->{rssfile}) or
+    die "error reading rss file $feed->{rssfile}";
+
+  return $feed->{rss};
+}
+
+# FIXME uses extra globals: ua, mdu
+sub drop_item {
+  my $feed = shift;
+  my $item = shift;
+  my ($rss, $tempdir) = @{$feed}{qw/rss tempdir/};
+
+  my $md5 = md5_hex($item->{link});
+  my $fetchfile = "$feed->{dir}/fetched/$md5";
+  my $deliverfile = "$feed->{dir}/delivered/$md5";
+
+  if (-e $deliverfile) {
+    verbose("already delivered item $item->{link}");
+    return;
+  }
+
+  my ($content, $mime);
+
+  if (!-e $fetchfile) {
+    if ($feed->{fulltext}) {
+      verbose("fetching item $item->{link}");
+
+      # optionally turn on cookies for the duration of this page fetch
+
+      if ($feed->{cookies}) {
+        $ua->cookie_jar({ file => "$tempdir/cookies.txt" });
+      }
+
+      fetch_atomic($ua, $item->{link}, $fetchfile, "$tempdir/$md5");
+
+      if ($feed->{cookies}) {
+        $ua->cookie_jar(undef);
+        !-e "$tempdir/cookies.txt" or unlink "$tempdir/cookies.txt" or 
+          die "error removing cookie file: $!";
+      }
+
+      $content = slurp_file($fetchfile);
+      $mime = 
+        substr($content, 0, 1024) =~ m#<html>#i ? 'text/html' :
+        mime($fetchfile) || 'text/plain';
+    }
+    else {
+      $content = XMLout($item, NoAttr => 1);
+      $mime = 'text/plain';
+      safe_cat($content, $fetchfile, "$tempdir/$md5");
+    }
+  }
+
+  # deliver the item as mail
+
+  my $unique = mdu_generate($mdu);
+  my ($tmp, $new) = map "$feed->{maildir}/$_/$unique" => qw/tmp new/;
+
+  open my $fh, '>', $tmp or
+    die "error opening $tmp for write: $!";
+
+  my $time =
+    rss_pub_time($item) ||
+    rss_pub_time($rss->{channel}) ||
+    time;
+
+  my $from =
+    rss_pub_email($item) ||
+    rss_pub_email($rss->{channel}) ||
+    'rssdrop@localhost';
+
+  print  $fh "Content-Type: $mime\n";
+  print  $fh "Content-Disposition: inline\n";
+  printf $fh 'Date: %s'."\n",
+    strftime('%a, %e %b %Y %H:%M:%S %z', localtime $time);
+  printf $fh 'From: %s'."\n", $from;
+  printf $fh 'Subject: %s'."\n", $item->{title};
+  print  $fh "\n";
+  print  $fh $content;
+
+  close $fh or
+    die "error closing $tmp after write: $!";
+
+  rename $tmp => $new or
+    die "error moving $tmp to $new: $!";
+
+  rename $fetchfile => $deliverfile or
+    die "error renaming $fetchfile => $deliverfile";
+}
+
+sub rss_items {
+  my $rss = shift;
+  my $items = $rss->{item} || $rss->{channel}->{item} || [];
+  return ref $items eq 'ARRAY' ? $items : [ $items ];
+}
+
+sub rss_pub_time {
+  my $elem = shift;
+  my $pubdate = $elem->{'dc:date'} || $elem->{pubDate} or
+    return undef;
+  my $date = ParseDate($pubdate) or return undef;
+  return UnixDate($date, '%s');
+}
+
+# TODO extract email from item body (e.g. for craigslist)
+sub rss_pub_email {
+  my $elem = shift;
+  return $elem->{'dc:creator'} || $elem->{'dc:publisher'} or undef;
+}
+
+sub fetch_atomic {
+  my ($ua, $url, $file, $tempfile) = @_;
+  my $response = $ua->get($url, ':content_file' => $tempfile);
+ 
+  die "error fetching $url" unless $response;
+  die "error fetching $url: ".$response->message if $response->is_error;
+
+  rename $tempfile => $file or
+    die "error moving $tempfile to $file: $!";
+}
+
+sub init_maildir {
+  my $dir = shift;
+  ensure_dir("$dir/$_") for qw/cur new tmp/;
+}
+
+sub init_feeddir {
+  my $dir = shift;
+  ensure_dir("$dir/$_") for qw/rss fetched delivered tmp/;
+}
+
+sub mdu_init {
+  my $host = `hostname`;
+  die "error executing hostname: ".($? >> 1) if $?;
+  chomp $host;
+  return { host => $host, delivered => 0 };
+}
+
+sub mdu_generate {
+  my $mdu = shift;
+  return sprintf '%d.%d_%d.%s', +time, $$, $mdu->{delivered}++, $mdu->{host};
+}
+
+sub read_config {
+  my $file = shift;
+  my $section;
+  my %config = ( feeds => {} );
+
+  open my $fh, '<', $file or
+    die "error opening $file for read: $!";
+
+  while (<$fh>) {
+    chomp;
+    s/^\s+//;
+    s/\s+$//;
+    next unless $_;
+    next if /^#/;
+
+    if (/^\[(.+)\]/) {
+      # enter a new section
+      $section = $1;
+      $config{feeds}->{$section} = {};
+    }
+    elsif (/^(\S+)\s*=\s*(\S+)$/) {
+      # augment a section, or global config
+      $section ?
+        $config{feeds}->{$section}->{$1} = $2 :
+        $config{$1} = $2;
+    }
+    else {
+      die "config syntax error ($.): $_";
+    }
+  }
+
+  close $fh or
+    die "error closing $file after read: $!";
+
+  return \%config;
+}
+
+sub serialise_config {
+  my $config = shift;
+  my $str = '';
+
+  # global config
+
+  for (grep $_ ne 'feeds' => keys %$config) {
+    $str .= "$_ = $config->{$_}\n";
+  }
+
+  $str .= "\n";
+
+  # per-feed config
+
+  for my $feedname (sort keys %{$config->{feeds}}) {
+    my $feed = $config->{feeds}->{$feedname};
+    $str .= "[$feedname]\n";
+    $str .= "$_ = $feed->{$_}\n" for keys %$feed;
+    $str .= "\n";
+  }
+
+  return $str;
+}
+
+sub safe_write_config {
+  my $config = shift;
+  my $str = serialise_config($config);
+  my $tempdir = tempdir("$opt{prefix}/tmp.XXXXXX");
+
+  safe_cat($str, "$opt{prefix}/config", "$tempdir/config");
+
+  rmdir $tempdir or
+    die "error removing tempdir $tempdir: $!";
+}
+
+sub ensure_dir {
+  my $dir = shift;
+  my @parts = split m{/} => $dir;
+  my $p;
+
+  do {
+    if ($p = defined $p ? $p.'/'.shift @parts : shift @parts) {
+      -d $p or mkdir $p or die "mkdir failed: $!";
+    }
+  } while (@parts);
+}
+
+sub slurp_file {
+  my $file = shift;
+  
+  open my $fh, '<', $file or
+    die "error opening $file for read: $!";
+  my $content = do { local $/; <$fh> };
+  close $fh or
+    die "error closing $file after read: $!";
+
+  return $content;
+}
+
+sub safe_cat {
+  my $data = shift;
+  my $file = shift;
+  my $tempfile = shift;
+
+  open my $fh, '>', "$tempfile" or
+    die "error opening $tempfile for write: $!";
+
+  print $fh $data;
+  
+  close $fh or
+    die "error closing $tempfile after write: $!";
+
+  rename $tempfile => $file or
+    die "error rename $tempfile to $file: $!";
+}
+
+sub tempdir {
+  my $template = shift;
+  $template =~ s/(X+)// or
+    die "bad tempdir template: $template";
+  my $fill = length $1;
+  my @set = ('A' .. 'Z', 'a' .. 'z', 0 .. 9 );
+  my $attempts = 1000;
+
+  unless ($template =~ m{/}) {
+    $template = ($ENV{TMPDIR}||'/tmp').'/'.$template;
+  }
+
+  for (my $i=0; $i<$attempts; $i++) {
+    my $noise = join('' => map $set[rand @set] => 1 .. $fill);
+    my $path = $template.$noise;
+    next unless mkdir $path, 0700;
+    return $path;
+  }
+
+  die "max tempdir attempts ($attempts) reached.";
+}
+
+sub mime {
+  my $file = shift;
+  my $mime = `file -b -i "$file"`;
+  die "error guessing mime type for $file: ".($? >> 1) if $?;
+  chomp $mime;
+  return $mime;
+}
+
+sub verbose {
+  return unless $opt{verbose};
+
+  for (@_) {
+    print STDERR $_;
+    print "\n" unless /\n$/;
+  }
+}
+
+__END__
+
+=head1 NAME
+
+rssdrop - deliver rss feeds to Maildirs
+
+=head1 SYNOPSIS
+
+rssdrop [-a feed url] | [-d feed] | [feed1 feed2 ...]
+
+=head1 EXAMPLES 
+
+Initialize rssdrop:
+
+  $ rssdrop --mailfolder path/to/mailfolder
+
+Subscribe to a new feed:
+
+  $ rssdrop -a acme-widgets http://acme.com/widgets.rss
+
+Fetch items in your new feed:
+
+  $ rssdrop acme-widgets
+
+Unsubscribe:
+
+  $ rssdrop -d acme-widgets
+
+Fetch all new items in all feeds:
+
+  $ rssdrop
+
+=head1 DESCRIPTION
+
+rssdrop is a simple RSS -> mail gateway. It delivers new RSS feed
+items directly to a local Maildir folder of your choice. You can use
+your favorite mail client to read them.
+
+rssdrop knows the basic structure of RSS 1.0 and 2.0 feeds, enough
+to deliver the raw item xml as the body of the message, or fetch
+the fulltext from the item link. Use fulltext = 1 in your feed config
+for that.
+
+=head1 OPTIONS
+
+=over 4
+
+=item --add feed1 url1 feed2 url2 ...
+
+Add named feeds to your config. Checks that the url has valid rss.
+
+=item --delete feed1 feed2 ...
+
+Remove named feeds from your config.
+
+=item --prefix path/to/rssdrop/dir
+
+Controls where rssdrop will save its config. Fetched feeds and items
+are also stored here.
+
+By default, rssdrop uses the $RSSDROP_PREFIX variable. If not set, it
+falls back to $HOME/.rssdrop. This directory will be created and
+populated with an initial config file if they don't exist.
+
+=item --mailfolder path/to/mailfolder
+
+Sets the mailfolder rssdrop should deliver new items to. Each feed
+has its own Maildir beneath $mailfolder. rssdrop will create a Maildir
+for a feed if one doesn't exist.
+
+This option is required and initially has no default. After one-time
+setup, however, rssdrop saves your $mailfolder setting in the global
+section of the config file. If you're happy with this setting, there's
+no need to specify --mailfolder after that.
+
+=item --verbose 
+
+Turn on extra logging messages. By default, rssdrop is quiet.
+
+=item --help
+
+Display usage information.
+
+=back
+
+=head1 TODO
+
+=over 4
+
+=item *
+
+output crontab entries, choosing intervals based rss update info
+
+=item *
+
+honor fulltext = 1 config feed option 
+
+=item *
+
+add a --cleanup option to remove old / unused feed state
+
+=item *
+
+try to extract a sender address from item content / rss
+
+=back
+
+=head1 CONFIGURATION
+
+The rssdrop config file (by default, ~/.rssdrop/config) uses a simple
+ini-style format, with a global config section followed by feed-specific
+config. Here's a sample:
+
+  mailfolder = /home/jdoe/var/mail
+
+  [freebsd-sa]
+  url = http://www.freebsd.org/security/advisories.rdf
+
+  [craigslist-nyc-cheap-apts]
+  fulltext = 1
+  url = http://newyork.craigslist.org/search/aap?query=&minAsk=1000&maxAsk=2000&bedrooms=&format=rss
+
+=head1 BUGS
+
+This is an experimental release. Please report bugs on CPAN.
+
+=head1 AUTHOR
+
+Alan Grow <agrow+nospam@thegotonerd.com>
+
+=head1 COPYRIGHT
+
+Copyright (C) 2007 by Alan Grow
+
+This application is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.3 or, at
+your option, any later version of Perl 5 you may have available.
+
+=cut
+
