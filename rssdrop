@@ -9,7 +9,13 @@ use Date::Manip;
 use strict;
 
 my %opt = ( prefix => $ENV{RSSDROP_PREFIX} || "$ENV{HOME}/.rssdrop" );
-my @getopt = qw/prefix=s mailfolder=s add delete verbose help/;
+my @getopt =
+  qw/prefix=s
+     mailfolder=s
+     add
+     delete
+     verbose
+     help/;
 
 GetOptions(\%opt, @getopt) or do { print STDERR usage(); exit 1; };
 do { print usage(); exit 0; } if $opt{help};
@@ -22,6 +28,8 @@ if (!-e "$opt{prefix}/config") {
 my $config = read_config("$opt{prefix}/config");
 my $mdu = mdu_init();
 my $ua = LWP::UserAgent->new;
+my $tempdir =
+  tempdir(sprintf '%s/tmp.XXXXXX.%s', $opt{prefix}, strftime('%F', localtime));
 
 $config->{mailfolder} = $opt{mailfolder} if $opt{mailfolder};
 
@@ -49,20 +57,12 @@ else {
   my @feednames = @ARGV ? @ARGV : sort keys %{$config->{feeds}};
 
   for my $feedname (@feednames) {
-    my $feed = $config->{feeds}->{$feedname};
-    $feed->{name} = $feedname;
-    $feed->{dir} = "$opt{prefix}/feeds/$feedname";
-    $feed->{maildir} = "$config->{mailfolder}/$feedname";
-
-    init_feeddir($feed->{dir});
-    init_maildir($feed->{maildir});
-
-    $feed->{tempdir} = tempdir("$feed->{dir}/XXXXX");
-    $feed->{rssfile} = "$feed->{dir}/rss/index.rss";
-
-    # fetch and parse the rss feed
-
-    fetch_feed($feed);
+    my $feed = eval { load_feed($feedname, fetch => 1) };
+    
+    if ($@) {
+      print "feed error ($feedname): $@";
+      next;
+    }
 
     # process items in the feed: fetch fulltext and deliver
 
@@ -71,10 +71,11 @@ else {
       warn "$@" if $@;
     }
 
-    rmdir $feed->{tempdir} or
-      die "error removing temporary directory $feed->{tempdir}: $!";
   }
 }
+
+$tempdir and rmdir $tempdir or
+  die "error removing temporary directory $tempdir: $!";
 
 exit 0;
 
@@ -98,26 +99,43 @@ sub usage {
 sub setup {
   die "no mailfolder specified (--mailfolder=xyz)" unless $opt{mailfolder};
   ensure_dir($opt{prefix});
+  ensure_dir("$opt{prefix}/tmp");
   safe_write_config({ mailfolder => $opt{mailfolder} });
+}
+
+sub load_feed {
+  my $feedname = shift;
+  my %arg = @_;
+  my $feed = $config->{feeds}->{$feedname} or
+    die "error: no such feed $feedname";
+
+  $feed->{name} = $feedname;
+  $feed->{dir} = "$opt{prefix}/feeds/$feedname";
+  $feed->{maildir} = "$config->{mailfolder}/$feedname";
+
+  init_feeddir($feed->{dir});
+  init_maildir($feed->{maildir});
+
+  $feed->{rssfile} = "$feed->{dir}/rss/index.rss";
+  fetch_feed($feed) if $arg{fetch};
+
+  $feed->{rss} = XMLin($feed->{rssfile}) or
+    die "error reading rss file $feed->{rssfile}";
+
+  return $feed;
 }
 
 sub fetch_feed {  
   my $feed = shift;
 
   verbose("fetching feed $feed->{url}");
-  fetch_atomic($ua, @{$feed}{qw/url rssfile/}, "$feed->{tempdir}/index.rss");
-
-  $feed->{rss} = XMLin($feed->{rssfile}) or
-    die "error reading rss file $feed->{rssfile}";
-
-  return $feed->{rss};
+  fetch_atomic($ua, @{$feed}{qw/url rssfile/}, "$tempdir/index.rss");
 }
 
-# FIXME uses extra globals: ua, mdu
 sub drop_item {
   my $feed = shift;
   my $item = shift;
-  my ($rss, $tempdir) = @{$feed}{qw/rss tempdir/};
+  my $rss = $feed->{rss};
 
   my $md5 = md5_hex($item->{link});
   my $fetchfile = "$feed->{dir}/fetched/$md5";
@@ -147,17 +165,21 @@ sub drop_item {
         !-e "$tempdir/cookies.txt" or unlink "$tempdir/cookies.txt" or 
           die "error removing cookie file: $!";
       }
-
-      $content = slurp_file($fetchfile);
-      $mime = 
-        substr($content, 0, 1024) =~ m#<html>#i ? 'text/html' :
-        mime($fetchfile) || 'text/plain';
     }
     else {
       $content = XMLout($item, NoAttr => 1);
-      $mime = 'text/plain';
       safe_cat($content, $fetchfile, "$tempdir/$md5");
     }
+  }
+
+  $content ||= slurp_file($fetchfile);
+
+  if ($feed->{fulltext}) {
+    $mime = substr($content, 0, 1024) =~ m#<html>#i ? 'text/html' :
+            mime($fetchfile) || 'text/plain';
+  }
+  else {
+    $mime = 'text/plain';
   }
 
   # deliver the item as mail
@@ -174,8 +196,12 @@ sub drop_item {
     time;
 
   my $from =
-    rss_pub_email($item) ||
-    rss_pub_email($rss->{channel}) ||
+    scrape_email(
+      $item->{'dc:creator'},
+      $item->{'dc:publisher'},
+      $content,
+      $rss->{channel}->{'dc:creator'},
+      $rss->{channel}->{'dc:publisher'}) ||
     'rssdrop@localhost';
 
   print  $fh "Content-Type: $mime\n";
@@ -190,8 +216,10 @@ sub drop_item {
   close $fh or
     die "error closing $tmp after write: $!";
 
-  rename $tmp => $new or
-    die "error moving $tmp to $new: $!";
+  link $tmp => $new or
+    die "error hardlinking $tmp to $new: $!";
+  unlink $tmp or
+    die "error removing temporary file $tmp: $!";
 
   rename $fetchfile => $deliverfile or
     die "error renaming $fetchfile => $deliverfile";
@@ -211,10 +239,10 @@ sub rss_pub_time {
   return UnixDate($date, '%s');
 }
 
-# TODO extract email from item body (e.g. for craigslist)
-sub rss_pub_email {
-  my $elem = shift;
-  return $elem->{'dc:creator'} || $elem->{'dc:publisher'} or undef;
+sub scrape_email {
+  for (grep $_ => @_) {
+    return $1 if /(\S+\@\S+\.\S+)/;
+  }
 }
 
 sub fetch_atomic {
@@ -314,7 +342,6 @@ sub serialise_config {
 sub safe_write_config {
   my $config = shift;
   my $str = serialise_config($config);
-  my $tempdir = tempdir("$opt{prefix}/tmp.XXXXXX");
 
   safe_cat($str, "$opt{prefix}/config", "$tempdir/config");
 
@@ -358,7 +385,6 @@ sub safe_cat {
   
   close $fh or
     die "error closing $tempfile after write: $!";
-
   rename $tempfile => $file or
     die "error rename $tempfile to $file: $!";
 }
@@ -487,28 +513,6 @@ Display usage information.
 
 =back
 
-=head1 TODO
-
-=over 4
-
-=item *
-
-output crontab entries, choosing intervals based rss update info
-
-=item *
-
-honor fulltext = 1 config feed option 
-
-=item *
-
-add a --cleanup option to remove old / unused feed state
-
-=item *
-
-try to extract a sender address from item content / rss
-
-=back
-
 =head1 CONFIGURATION
 
 The rssdrop config file (by default, ~/.rssdrop/config) uses a simple
@@ -524,9 +528,25 @@ config. Here's a sample:
   fulltext = 1
   url = http://newyork.craigslist.org/search/aap?query=&minAsk=1000&maxAsk=2000&bedrooms=&format=rss
 
+=head1 TODO
+
+=over 4
+
+=item * use attachments for fulltext mode
+
+=item * add a --cleanup option to remove old / unused feed state
+
+=back
+
 =head1 BUGS
 
 This is an experimental release. Please report bugs on CPAN.
+
+=over 4
+
+=item * fix non-empty rmdir error after fetch failure
+
+=back
 
 =head1 AUTHOR
 
