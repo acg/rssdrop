@@ -8,7 +8,11 @@ use LWP::UserAgent;
 use Date::Manip;
 use strict;
 
-my %opt = ( prefix => $ENV{RSSDROP_PREFIX} || "$ENV{HOME}/.rssdrop" );
+my %opt = (
+  prefix => $ENV{RSSDROP_PREFIX} || "$ENV{HOME}/.rssdrop",
+  fetch => 1,
+);
+
 my @getopt =
   qw/prefix=s
      mailfolder=s
@@ -415,7 +419,7 @@ sub safe_cat {
 
   binmode $fh, ':utf8';
   print $fh $data;
-  
+ 
   close $fh or
     die "error closing $tempfile after write: $!";
   rename $tempfile => $file or
@@ -453,7 +457,8 @@ sub mime {
 }
 
 sub looks_like_html {
-  return substr(shift, 0, 4096) =~ m{(</a>|</b>|</i>|</u>|<p>|<br\s*/?>|&\w{2,6};)}i;
+  return substr(shift, 0, 4096) =~
+    m{(</a>|</b>|</i>|</u>|<p>|<br\s*/?>|&\w{2,6};)}i;
 }
 
 sub verbose {
@@ -584,6 +589,7 @@ sub pub_time {
 
 
 package Feed::Item::RSS;
+use XML::Simple qw/XMLout XMLin/;
 
 sub new { bless $_[1] => ref($_[0]) || $_[0]; }
 sub link { return $_[0]->{link} }
