@@ -14,6 +14,8 @@ my @getopt =
      mailfolder=s
      add
      delete
+     fetch!
+     umask=s
      verbose
      help/;
 
@@ -28,19 +30,26 @@ if (!-e "$opt{prefix}/config") {
 my $config = read_config("$opt{prefix}/config");
 my $mdu = mdu_init();
 my $ua = LWP::UserAgent->new;
-my $tempdir =
-  tempdir(sprintf '%s/tmp.XXXXXX.%s', $opt{prefix}, strftime('%F', localtime));
+my $tempdir_xxx = sprintf '%s/tmp.%s.XXXXXX'
+  => $opt{prefix}, strftime('%F', localtime);
+my $tempdir = tempdir($tempdir_xxx);
 
 $config->{mailfolder} = $opt{mailfolder} if $opt{mailfolder};
 
+umask($opt{umask} ? oct($opt{umask}) : 0077);
+
 if ($opt{add}) {
   while (my ($feedname, $feedurl) = splice @ARGV, 0, 2) {
-    my $response = $ua->get($feedurl);
-    die "error fetching feed" unless $response;
-    die "error fetching feed: $response->message" unless $response->is_success;
+    my $format = eval { taste_feed($feedurl) };
 
-    my $rss = eval { XMLin($response->content) };
-    die "error, invalid rss: $feedurl" if $@ or !$rss or !$rss->{channel};
+    if ($@) {
+      warn "error fetching or parsing feed, not adding: $@\n";
+      next;
+    }
+    elsif (!$format) {
+      warn "unknown feed format, not adding\n";
+      next;
+    }
 
     $config->{feeds}->{$feedname}->{url} = $feedurl;
   }
@@ -57,7 +66,7 @@ else {
   my @feednames = @ARGV ? @ARGV : sort keys %{$config->{feeds}};
 
   for my $feedname (@feednames) {
-    my $feed = eval { load_feed($feedname, fetch => 1) };
+    my $feed = eval { load_feed($feedname, fetch => $opt{fetch}) };
     
     if ($@) {
       print "feed error ($feedname): $@";
@@ -66,15 +75,14 @@ else {
 
     # process items in the feed: fetch fulltext and deliver
 
-    for my $item (@{ rss_items($feed->{rss}) }) {
+    for my $item (@{ $feed->items }) {
       eval { drop_item($feed, $item); };
       warn "$@" if $@;
     }
-
   }
 }
 
-$tempdir and rmdir $tempdir or
+$tempdir and -d $tempdir and rmdir $tempdir or
   die "error removing temporary directory $tempdir: $!";
 
 exit 0;
@@ -82,11 +90,16 @@ exit 0;
 
 sub usage {
   my $usage = qq{
-  rssdrop [-a feed url] | [-d feed] | [feed1 feed2 ...]
-    --add          feed1 url1 feed2 urls2
-    --delete       feed1 feed2
-    --prefix       path/to/rssdrop/dir
-    --mailfolder   path/to/mailfolder
+  rssdrop feed1 feed2 ...    # fetch new feed entries
+  rssdrop -a feedname url    # subscribe to a new feed
+  rssdrop -d feedname        # unsubscribe
+
+    --add                      feed1 url1 feed2 url2 ...
+    --delete                   feed1 feed2 ...
+    --nofetch                  don't fetch feeds or fulltext
+    --umask NUM                specify octal umask for new files [077]
+    --prefix DIR               path/to/rssdrop/dir
+    --mailfolder DIR           path/to/maildir/folder/area
     --verbose
     --help
   };
@@ -103,6 +116,22 @@ sub setup {
   safe_write_config({ mailfolder => $opt{mailfolder} });
 }
 
+sub taste_feed {
+  my $url = shift;
+  my $response = $ua->get($url);
+
+  die "error fetching feed" unless $response;
+  die "error fetching feed: $response->message" unless
+    $response->is_success;
+
+  my $index = eval { XMLin($response->content) };
+
+  die "error, invalid feed xml at $url: $@" if $@;
+  die "empty feed xml at $url" unless $index;
+
+  return Feed->new({ index => $index })->format;
+}
+
 sub load_feed {
   my $feedname = shift;
   my %arg = @_;
@@ -110,17 +139,28 @@ sub load_feed {
     die "error: no such feed $feedname";
 
   $feed->{name} = $feedname;
-  $feed->{dir} = "$opt{prefix}/feeds/$feedname";
-  $feed->{maildir} = "$config->{mailfolder}/$feedname";
+  $feed->{folder} ||= $feedname;
+  $feed->{dir} = "$opt{prefix}/feeds/$feed->{folder}";
+  $feed->{maildir} = "$config->{mailfolder}/$feed->{folder}";
 
   init_feeddir($feed->{dir});
   init_maildir($feed->{maildir});
 
-  $feed->{rssfile} = "$feed->{dir}/rss/index.rss";
+  $feed->{feedfile} = "$feed->{dir}/rss/index.xml";
   fetch_feed($feed) if $arg{fetch};
 
-  $feed->{rss} = XMLin($feed->{rssfile}) or
-    die "error reading rss file $feed->{rssfile}";
+  my $xml = slurp_file($feed->{feedfile});
+  $xml =~ s/[^[:print:]]//;
+
+  my %xmlin_opts = (
+    ForceArray => [ qw/item entry/ ],
+    KeyAttr => []
+  );
+
+  $feed->{index} = XMLin($xml, %xmlin_opts) or
+    die "error reading rss file $feed->{feedfile}";
+
+  $feed = Feed->new($feed);
 
   return $feed;
 }
@@ -129,28 +169,32 @@ sub fetch_feed {
   my $feed = shift;
 
   verbose("fetching feed $feed->{url}");
-  fetch_atomic($ua, @{$feed}{qw/url rssfile/}, "$tempdir/index.rss");
+  fetch_atomic($ua, $feed->{url}, $feed->{feedfile}, "$tempdir/index.xml");
 }
+
+
+# TODO deliver fulltext and rss as separate multipart mime attachments
+# TODO add options for text/plain renderers
 
 sub drop_item {
   my $feed = shift;
   my $item = shift;
-  my $rss = $feed->{rss};
 
-  my $md5 = md5_hex($item->{link});
+  my $link = $item->link;
+  my $md5 = md5_hex($link);
   my $fetchfile = "$feed->{dir}/fetched/$md5";
   my $deliverfile = "$feed->{dir}/delivered/$md5";
 
   if (-e $deliverfile) {
-    verbose("already delivered item $item->{link}");
+    verbose("already delivered item $link");
     return;
   }
 
-  my ($content, $mime);
+  my $content;
 
   if (!-e $fetchfile) {
-    if ($feed->{fulltext}) {
-      verbose("fetching item $item->{link}");
+    if ($feed->{fulltext} && $opt{fetch}) {
+      verbose("fetching item $link");
 
       # optionally turn on cookies for the duration of this page fetch
 
@@ -158,7 +202,7 @@ sub drop_item {
         $ua->cookie_jar({ file => "$tempdir/cookies.txt" });
       }
 
-      fetch_atomic($ua, $item->{link}, $fetchfile, "$tempdir/$md5");
+      fetch_atomic($ua, $link, $fetchfile, "$tempdir/$md5");
 
       if ($feed->{cookies}) {
         $ua->cookie_jar(undef);
@@ -167,20 +211,31 @@ sub drop_item {
       }
     }
     else {
-      $content = XMLout($item, NoAttr => 1);
+      $content = $item->content;
       safe_cat($content, $fetchfile, "$tempdir/$md5");
     }
   }
 
   $content ||= slurp_file($fetchfile);
 
-  if ($feed->{fulltext}) {
-    $mime = substr($content, 0, 1024) =~ m#<html>#i ? 'text/html' :
-            mime($fetchfile) || 'text/plain';
-  }
-  else {
-    $mime = 'text/plain';
-  }
+  my $mime;
+
+  $mime ||= 'text/html' if looks_like_html($content);
+  $mime ||= mime($fetchfile) if $feed->{fulltext};
+  $mime ||= 'text/plain';
+
+  my $time;
+
+  $time ||= parse_time($item->pub_time);
+  $time ||= parse_time($feed->pub_time);
+  $time ||= time;
+
+  my $from;
+
+  $from ||= $item->author;
+  $from ||= $feed->author;
+  $from ||= scrape_email($content);  # this is getting pretty desperate
+  $from ||= 'rssdrop@localhost';
 
   # deliver the item as mail
 
@@ -190,26 +245,14 @@ sub drop_item {
   open my $fh, '>', $tmp or
     die "error opening $tmp for write: $!";
 
-  my $time =
-    rss_pub_time($item) ||
-    rss_pub_time($rss->{channel}) ||
-    time;
-
-  my $from =
-    scrape_email(
-      $item->{'dc:creator'},
-      $item->{'dc:publisher'},
-      $content,
-      $rss->{channel}->{'dc:creator'},
-      $rss->{channel}->{'dc:publisher'}) ||
-    'rssdrop@localhost';
+  binmode $fh, ':utf8';
 
   print  $fh "Content-Type: $mime\n";
   print  $fh "Content-Disposition: inline\n";
   printf $fh 'Date: %s'."\n",
     strftime('%a, %e %b %Y %H:%M:%S %z', localtime $time);
   printf $fh 'From: %s'."\n", $from;
-  printf $fh 'Subject: %s'."\n", $item->{title};
+  printf $fh 'Subject: %s'."\n", $item->title;
   print  $fh "\n";
   print  $fh $content;
 
@@ -225,24 +268,16 @@ sub drop_item {
     die "error renaming $fetchfile => $deliverfile";
 }
 
-sub rss_items {
-  my $rss = shift;
-  my $items = $rss->{item} || $rss->{channel}->{item} || [];
-  return ref $items eq 'ARRAY' ? $items : [ $items ];
-}
-
-sub rss_pub_time {
-  my $elem = shift;
-  my $pubdate = $elem->{'dc:date'} || $elem->{pubDate} or
-    return undef;
-  my $date = ParseDate($pubdate) or return undef;
-  return UnixDate($date, '%s');
-}
-
 sub scrape_email {
   for (grep $_ => @_) {
     return $1 if /(\S+\@\S+\.\S+)/;
   }
+}
+
+sub parse_time {
+  my $time = shift or return undef;
+  my $date = ParseDate($time) or return undef;
+  return UnixDate($date, '%s');
 }
 
 sub fetch_atomic {
@@ -344,9 +379,6 @@ sub safe_write_config {
   my $str = serialise_config($config);
 
   safe_cat($str, "$opt{prefix}/config", "$tempdir/config");
-
-  rmdir $tempdir or
-    die "error removing tempdir $tempdir: $!";
 }
 
 sub ensure_dir {
@@ -381,6 +413,7 @@ sub safe_cat {
   open my $fh, '>', "$tempfile" or
     die "error opening $tempfile for write: $!";
 
+  binmode $fh, ':utf8';
   print $fh $data;
   
   close $fh or
@@ -419,6 +452,10 @@ sub mime {
   return $mime;
 }
 
+sub looks_like_html {
+  return substr(shift, 0, 4096) =~ m{(</a>|</b>|</i>|</u>|<p>|<br\s*/?>|&\w{2,6};)}i;
+}
+
 sub verbose {
   return unless $opt{verbose};
 
@@ -428,6 +465,158 @@ sub verbose {
   }
 }
 
+
+
+package Feed;
+
+use XML::Simple qw/XMLin/;
+use strict;
+
+sub new {
+  my $this = shift;
+  my $self = ref $_[0] ? shift : { index => {} };
+  bless $self => ref($this) || $this;
+  return $self->init(@_);
+}
+
+sub init {
+  my $self = shift;
+  my $index = $self->{index};
+  my $source = shift;
+
+  if (ref $source eq 'HASH') {
+    $index->{$_} = $source->{$_} for keys %$source;
+  }
+  elsif ($source && !ref $source) {
+    my %xmlin_opts = (
+      ForceArray => [ qw/item entry/ ],
+      KeyAttr => []
+    );
+    my $data = XMLin($source, %xmlin_opts) or
+      die "error reading xml";
+    $index->{$_} = $data->{$_} for keys %$data;
+  }
+
+  # detect feed format & upgrade feed object
+
+  my %feed_classes = (
+    'Feed::RSS' => qr{^rss/},
+    'Feed::Atom' => qr{^atom/},
+  );
+
+  my $format = $self->format;
+
+  while (my ($package, $re_format) = each %feed_classes) {
+    if ($format =~ $re_format) {
+      bless $self => $package;
+      last;
+    }
+  }
+
+  return $self;
+}
+
+sub format {
+  my $index = shift->{index};
+
+  return 'atom/1.0' if $index->{entry};
+  return 'rss/1.0' if $index->{item};
+  return 'rss/2.0' if $index->{channel};
+
+  return undef;
+}
+
+sub items {
+  die "can't fetch items for unknown feed format ".(shift->format);
+}
+
+1;
+
+
+package Feed::RSS;
+use base qw/Feed/;
+
+sub items {
+  my $self = shift;
+  my $index = $self->{index};
+  my $format = $self->format;
+  my $items = 
+    $format eq 'rss/2.0' ? $index->{channel}->{item} :
+    $format eq 'rss/1.0' ? $index->{item} :
+      die "unknown rss format $format";
+
+  $items = [ $items ] unless ref $items eq 'ARRAY';
+
+  return [ map Feed::Item::RSS->new($_) => @{$items} ];
+}
+
+sub pub_time {
+  my $channel = shift->{index}->{channel} or return undef;
+  return $channel->{'dc:date'} || $channel->{pubDate};
+}
+
+sub author {
+  my $channel = shift->{index}->{channel} or return undef;
+  return $channel->{'dc:creator'} || $channel->{'dc:publisher'};
+}
+
+1;
+
+
+package Feed::Atom;
+use base qw/Feed/;
+
+sub items {
+  my $index = shift->{index};
+  return [ map Feed::Item::Atom->new($_) => @{$index->{entry}} ];
+}
+
+sub author {
+  my $w = shift->{index}->{author} or return undef;
+  return "$w->{email} <$w->{name}>";
+}
+
+sub pub_time {
+  return undef;
+}
+
+1;
+
+
+package Feed::Item::RSS;
+
+sub new { bless $_[1] => ref($_[0]) || $_[0]; }
+sub link { return $_[0]->{link} }
+sub title { return $_[0]->{title} }
+sub pub_time { return $_[0]->{'dc:date'} || $_[0]->{pubDate} }
+sub author { return $_[0]->{'dc:creator'} || $_[0]->{'dc:publisher'} }
+sub content { return XMLout($_[0], NoAttr => 1, NoEscape => 1) }
+
+1;
+
+
+package Feed::Item::Atom;
+
+sub new { bless $_[1] => ref($_[0]) || $_[0]; }
+sub title { return _atom_content(shift->{title}) }
+sub content { return _atom_content(shift->{content}) }
+sub pub_time { return _atom_content(shift->{published}) }
+sub author { my $w = shift->{author}; return "$w->{email} <$w->{name}>" }
+
+sub link {
+  my $link = shift->{link};
+  return $link->[-1]->{href} if ref $link eq 'ARRAY';
+  return $link->{href};
+}
+
+sub _atom_content {
+  return $_[0]->{content} if ref $_[0] eq 'HASH' && exists $_[0]->{content};
+  return $_[0];
+}
+
+1;
+
+
 __END__
 
 =head1 NAME
@@ -436,7 +625,7 @@ rssdrop - deliver rss feeds to Maildirs
 
 =head1 SYNOPSIS
 
-rssdrop [-a feed url] | [-d feed] | [feed1 feed2 ...]
+rssdrop [ feedname1 feedname2 ... ] | [ -a feedname url ] | [ -d feedname ]
 
 =head1 EXAMPLES 
 
@@ -466,7 +655,7 @@ rssdrop is a simple RSS -> mail gateway. It delivers new RSS feed
 items directly to a local Maildir folder of your choice. You can use
 your favorite mail client to read them.
 
-rssdrop knows the basic structure of RSS 1.0 and 2.0 feeds, enough
+rssdrop knows the basic structure of RSS 1.0, 2.0 and ATOM feeds, enough
 to deliver the raw item xml as the body of the message, or fetch
 the fulltext from the item link. Use fulltext = 1 in your feed config
 for that.
@@ -475,11 +664,11 @@ for that.
 
 =over 4
 
-=item --add feed1 url1 feed2 url2 ...
+=item --add feedname1 url1 feedname2 url2 ...
 
 Add named feeds to your config. Checks that the url has valid rss.
 
-=item --delete feed1 feed2 ...
+=item --delete feedname1 feedname2 ...
 
 Remove named feeds from your config.
 
@@ -532,7 +721,11 @@ config. Here's a sample:
 
 =over 4
 
-=item * use attachments for fulltext mode
+=item * use mime multiparts to separate feed from fulltext
+
+=item * support feed-specific post-processing filters
+
+=item * handle unicode
 
 =item * add a --cleanup option to remove old / unused feed state
 
@@ -550,11 +743,11 @@ This is an experimental release. Please report bugs on CPAN.
 
 =head1 AUTHOR
 
-Alan Grow <agrow+nospam@thegotonerd.com>
+Alan Grow <agrow+nospam@iobound.net>
 
 =head1 COPYRIGHT
 
-Copyright (C) 2007 by Alan Grow
+Copyright (C) 2008 by Alan Grow
 
 This application is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.8.3 or, at
