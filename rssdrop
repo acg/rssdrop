@@ -122,10 +122,13 @@ sub setup {
 
 sub taste_feed {
   my $url = shift;
+
+  verbose("tasting feed at $url");
+
   my $response = $ua->get($url);
 
   die "error fetching feed" unless $response;
-  die "error fetching feed: $response->message" unless
+  die "error fetching feed: ".$response->message unless
     $response->is_success;
 
   my $index = eval { XMLin($response->content) };
@@ -524,6 +527,7 @@ sub init {
 sub format {
   my $index = shift->{index};
 
+  return 'atom/1.0' if $index->{'xmlns:atom'};
   return 'atom/1.0' if $index->{entry};
   return 'rss/1.0' if $index->{item};
   return 'rss/2.0' if $index->{channel};
@@ -711,7 +715,7 @@ Display usage information.
 =head1 CONFIGURATION
 
 The rssdrop config file (by default, ~/.rssdrop/config) uses a simple
-ini-style format, with a global config section followed by feed-specific
+ini-style format with a global config section followed by feed-specific
 config. Here's a sample:
 
   mailfolder = /home/jdoe/var/mail
@@ -729,9 +733,7 @@ config. Here's a sample:
 
 =item * use mime multiparts to separate feed from fulltext
 
-=item * support feed-specific post-processing filters
-
-=item * handle unicode
+=item * support per-feed mimetype conversion filters
 
 =item * add a --cleanup option to remove old / unused feed state
 
@@ -739,13 +741,7 @@ config. Here's a sample:
 
 =head1 BUGS
 
-This is an experimental release. Please report bugs on CPAN.
-
-=over 4
-
-=item * fix non-empty rmdir error after fetch failure
-
-=back
+Please report bugs on CPAN.
 
 =head1 AUTHOR
 
