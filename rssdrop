@@ -554,6 +554,7 @@ sub items {
     $format eq 'rss/1.0' ? $index->{item} :
       die "unknown rss format $format";
 
+  $items = [ ] if !defined $items;
   $items = [ $items ] unless ref $items eq 'ARRAY';
 
   return [ map Feed::Item::RSS->new($_) => @{$items} ];
