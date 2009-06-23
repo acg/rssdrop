@@ -291,8 +291,9 @@ sub fetch_atomic {
   my ($ua, $url, $file, $tempfile) = @_;
   my $response = $ua->get($url, ':content_file' => $tempfile);
  
-  die "error fetching $url" unless $response;
-  die "error fetching $url: ".$response->message if $response->is_error;
+  die "error fetching $url: no response" unless $response;
+  die "error fetching $url: ".$response->code." ".$response->message if
+    $response->is_error;
 
   rename $tempfile => $file or
     die "error moving $tempfile to $file: $!";
@@ -597,11 +598,16 @@ package Feed::Item::RSS;
 use XML::Simple qw/XMLout XMLin/;
 
 sub new { bless $_[1] => ref($_[0]) || $_[0]; }
-sub link { return $_[0]->{link} }
 sub title { return $_[0]->{title} }
 sub pub_time { return $_[0]->{'dc:date'} || $_[0]->{pubDate} }
 sub author { return $_[0]->{'dc:creator'} || $_[0]->{'dc:publisher'} }
 sub content { return XMLout($_[0], NoAttr => 1, NoEscape => 1) }
+
+sub link {
+  my $self = shift;
+  my @links = grep $_ && !ref $_ => map $self->{$_} => qw/link guid/;
+  return $links[0];
+}
 
 1;
 
