@@ -157,7 +157,7 @@ sub load_feed {
   fetch_feed($feed) if $arg{fetch};
 
   my $xml = slurp_file($feed->{feedfile});
-  $xml =~ s/[^[:print:]]//;
+  $xml =~ s/[^[:print:]]//g;
 
   my %xmlin_opts = (
     ForceArray => [ qw/item entry/ ],
