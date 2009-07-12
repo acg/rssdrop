@@ -191,9 +191,15 @@ sub drop_item {
   my $md5 = md5_hex($link);
   my $fetchfile = "$feed->{dir}/fetched/$md5";
   my $deliverfile = "$feed->{dir}/delivered/$md5";
+  my $errorfile = "$feed->{dir}/error/$md5";
 
   if (-e $deliverfile) {
     verbose("already delivered item $link");
+    return;
+  }
+
+  if (-e $errorfile && !$feed->{retry}) {
+    verbose("skipping failed item $link (consider 'retry = 1')");
     return;
   }
 
@@ -209,7 +215,18 @@ sub drop_item {
         $ua->cookie_jar({ file => "$tempdir/cookies.txt" });
       }
 
-      fetch_atomic($ua, $link, $fetchfile, "$tempdir/$md5");
+      if (my $err = fetch_atomic($ua, $link, $fetchfile, "$tempdir/$md5")) {
+        verbose("error fetching item $link ($err->[0]: $err->[1])");
+        rename $fetchfile => $errorfile or
+          die "error renaming $fetchfile => $errorfile: $!";
+        return;
+      }
+      else {
+        if (-e $errorfile) {
+          unlink $errorfile or
+            die "error removing old error file $errorfile: $!";
+        }
+      }
 
       if ($feed->{cookies}) {
         $ua->cookie_jar(undef);
@@ -292,11 +309,21 @@ sub fetch_atomic {
   my $response = $ua->get($url, ':content_file' => $tempfile);
  
   die "error fetching $url: no response" unless $response;
-  die "error fetching $url: ".$response->code." ".$response->message if
-    $response->is_error;
+
+  if (!-e $tempfile) {
+    open my $fh, '>', $tempfile or
+      die "error opening $tempfile for write: $!";
+    printf $fh "%s %s (%s)" =>
+      $response->code, $response->message, $url;
+    close $fh or
+      die "error closing $tempfile after write: $!";
+  }
 
   rename $tempfile => $file or
     die "error moving $tempfile to $file: $!";
+
+  return 0 if $response->is_success;
+  return [ $response->code, $response->message ];
 }
 
 sub init_maildir {
@@ -306,7 +333,7 @@ sub init_maildir {
 
 sub init_feeddir {
   my $dir = shift;
-  ensure_dir("$dir/$_") for qw/rss fetched delivered tmp/;
+  ensure_dir("$dir/$_") for qw/rss error fetched delivered tmp/;
 }
 
 sub mdu_init {
@@ -722,13 +749,14 @@ Display usage information.
 =head1 CONFIGURATION
 
 The rssdrop config file (by default, ~/.rssdrop/config) uses a simple
-ini-style format with a global config section followed by feed-specific
+.ini-style format with a global config section followed by feed-specific
 config. Here's a sample:
 
   mailfolder = /home/jdoe/var/mail
 
   [freebsd-sa]
   url = http://www.freebsd.org/security/advisories.rdf
+  retry = 1
 
   [craigslist-nyc-cheap-apts]
   fulltext = 1
