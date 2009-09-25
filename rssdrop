@@ -18,6 +18,7 @@ my @getopt =
      mailfolder=s
      add
      delete
+     list
      fetch!
      umask=s
      verbose
@@ -66,6 +67,11 @@ elsif ($opt{delete}) {
   }
   safe_write_config($config);
 }
+elsif ($opt{list}) {
+  for my $feedname (sort keys %{$config->{feeds}}) {
+    print $feedname.$/;
+  }
+}
 else {
   my @feednames = @ARGV ? @ARGV : sort keys %{$config->{feeds}};
 
@@ -100,6 +106,7 @@ sub usage {
 
     --add                      feed1 url1 feed2 url2 ...
     --delete                   feed1 feed2 ...
+    --list                     list all feeds subscribed to
     --nofetch                  don't fetch feeds or fulltext
     --umask NUM                specify octal umask for new files [077]
     --prefix DIR               path/to/rssdrop/dir
@@ -716,6 +723,10 @@ Add named feeds to your config. Checks that the url has valid rss.
 
 Remove named feeds from your config.
 
+=item --list
+
+List all feeds in your config.
+
 =item --prefix path/to/rssdrop/dir
 
 Controls where rssdrop will save its config. Fetched feeds and items
@@ -765,6 +776,8 @@ config. Here's a sample:
 =head1 TODO
 
 =over 4
+
+=item * add per-feed config item to control update schedule
 
 =item * use mime multiparts to separate feed from fulltext
 
